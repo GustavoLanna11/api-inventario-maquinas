@@ -1,11 +1,13 @@
-from flask import Flask, request, jsonify, Response, json
+from flask import Flask, request, jsonify, Response
 import os
 from werkzeug.utils import secure_filename
 import pandas as pd
+import json
+import numpy as np
 
 app = Flask(__name__)
 
-# 🧭 Caminhos absolutos para garantir que salva corretamente
+# Caminhos absolutos
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 DATA_FOLDER = os.path.join(BASE_DIR, "data")
@@ -13,6 +15,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
 PLANILHA_FINAL = os.path.join(DATA_FOLDER, "dados_gerais.xlsx")
+
 
 @app.route("/upload_excel", methods=["POST"])
 def upload_excel():
@@ -28,31 +31,27 @@ def upload_excel():
         return jsonify({"error": "Envie um arquivo .xlsx"}), 400
 
     try:
-        # 🔄 Salva temporariamente o arquivo
         temp_path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
         file.save(temp_path)
         print(f"📥 Arquivo salvo temporariamente em: {temp_path}")
 
-        # 📊 Lê os dados recebidos
         df_recebido = pd.read_excel(temp_path)
 
-        # 🗃 Junta ou cria planilha final
         if os.path.exists(PLANILHA_FINAL):
             df_atual = pd.read_excel(PLANILHA_FINAL)
             df_unido = pd.concat([df_atual, df_recebido], ignore_index=True)
         else:
             df_unido = df_recebido
 
-        # 💾 Salva corretamente dentro de /data
         df_unido.to_excel(PLANILHA_FINAL, index=False)
         print(f"✅ Planilha final salva em: {PLANILHA_FINAL}")
 
-        # 🧹 Remove o temporário
         os.remove(temp_path)
 
         return jsonify({"message": "✅ Dados adicionados com sucesso!"}), 200
 
     except Exception as e:
+        print(f"❌ Erro ao processar upload: {e}")
         return jsonify({"error": f"Erro ao processar: {e}"}), 500
 
 
@@ -63,8 +62,24 @@ def listar_dados():
 
     try:
         df = pd.read_excel(PLANILHA_FINAL)
-        dados_json = df.to_dict(orient="records")
-        return Response(json.dumps(dados_json, ensure_ascii=False, indent=2), mimetype='application/json')
+
+        # Corrige nomes de colunas
+        df.columns = [col.strip() if isinstance(col, str) else col for col in df.columns]
+
+        # Converte NaN/NaT para None de forma explícita
+        df = df.replace({np.nan: None, pd.NaT: None})
+
+        # Converte DataFrame para dicionário
+        dados_dict = df.to_dict(orient="records")
+
+        # Serializa para JSON garantindo que não haja NaN (só null)
+        json_str = json.dumps(dados_dict, ensure_ascii=False, allow_nan=False)
+
+        return Response(json_str, mimetype="application/json")
+
+    except ValueError as e:
+        # JSON inválido por conter NaN — debug
+        return jsonify({"error": f"Erro ao gerar JSON: {str(e)}"}), 500
     except Exception as e:
         return jsonify({"error": f"Erro ao ler a planilha: {e}"}), 500
 

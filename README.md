@@ -1,4 +1,4 @@
-# script-inventario
+# API
 
 <h2>Sobre o projeto ✍</h2>
 O repositório armazena uma API em Python que recebe os dados de um script em JSON e em XLSX, depois, os repassa para uma dashboard.<br>

@@ -1,57 +1,35 @@
 from flask import Flask, request, jsonify, Response
 import os
-from werkzeug.utils import secure_filename
-import pandas as pd
 import json
-import numpy as np
 from database import get_collection
 
 app = Flask(__name__)
 
 collection = get_collection()
 
-# Caminhos absolutos
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
 
 @app.route("/upload_excel", methods=["POST"])
 def upload_excel():
-    if "file" not in request.files:
-        return jsonify({"error": "Arquivo não encontrado"}), 400
-
-    file = request.files["file"]
-
-    if file.filename == "":
-        return jsonify({"error": "Nome do arquivo está vazio"}), 400
-
-    if not file.filename.lower().endswith(".xlsx"):
-        return jsonify({"error": "Envie um arquivo .xlsx"}), 400
-
     try:
-        temp_path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
-        file.save(temp_path)
-        print(f"📥 Arquivo salvo temporariamente em: {temp_path}")
+        data = request.get_json()
 
-        df_recebido = pd.read_excel(temp_path)
+        if not data:
+            return jsonify({"error": "JSON não enviado"}), 400
 
-        # Limpar NaN
-        df_recebido = df_recebido.replace({np.nan: None})
-        dados = df_recebido.to_dict("records")
+        # garante lista
+        if isinstance(data, dict):
+            data = [data]
 
-        for doc in dados:
-            # Usar Número de Série se existir, senão Nome da máquina
-            filtro = {}
+        for doc in data:
+
             if doc.get("Número de Série"):
                 filtro = {"Número de Série": doc["Número de Série"]}
             else:
                 filtro = {"Nome da máquina": doc.get("Nome da máquina", "")}
 
-            # Atualiza se existir, insere se não existir
             collection.update_one(filtro, {"$set": doc}, upsert=True)
 
-        os.remove(temp_path)
+        print("📦 Dados recebidos:", data)
 
         return jsonify({"message": "✅ Dados inseridos/atualizados no MongoDB!"})
 
@@ -84,5 +62,5 @@ def mongo_info():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("🚀 API rodando com MongoDB")
+    print("🚀 API rodando com MongoDB (modo JSON)")
     app.run(host="0.0.0.0", port=port)

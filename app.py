@@ -2,10 +2,17 @@ from flask import Flask, request, jsonify, Response
 import os
 import json
 from database import get_collection
+from pymongo.errors import DuplicateKeyError
 
 app = Flask(__name__)
 
 collection = get_collection()
+
+try:
+    collection.create_index("Nome da máquina", unique=True)
+    print("🔒 Índice único criado para 'Nome da máquina'")
+except Exception as e:
+    print(f"⚠️ Índice já existe ou erro ao criar: {e}")
 
 
 @app.route("/upload_excel", methods=["POST"])
@@ -22,12 +29,22 @@ def upload_excel():
 
         for doc in data:
 
-            if doc.get("Número de Série"):
-                filtro = {"Número de Série": doc["Número de Série"]}
-            else:
-                filtro = {"Nome da máquina": doc.get("Nome da máquina", "")}
+            nome_maquina = doc.get("Nome da máquina")
 
-            collection.update_one(filtro, {"$set": doc}, upsert=True)
+            if not nome_maquina:
+                return jsonify({"error": "Nome da máquina é obrigatório"}), 400
+
+            print("➡️ Processando:", nome_maquina, doc.get("Número de Série"))
+
+            filtro = {"Nome da máquina": nome_maquina}
+
+            try:
+                collection.update_one(filtro, {"$set": doc}, upsert=True)
+            except DuplicateKeyError:
+                print("⚠️ Duplicidade detectada (nome já existe)")
+                return jsonify({
+                    "error": "Máquina duplicada (nome já existe)"
+                }), 409
 
         print("📦 Dados recebidos:", data)
 

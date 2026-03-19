@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, Response
 import os
 import json
+from base64 import b64decode
 from database import get_collection
 from pymongo.errors import DuplicateKeyError
 
@@ -18,9 +19,40 @@ except Exception as e:
     print(f"⚠️ Índice já existe ou erro ao criar: {e}")
 
 
+# 🔐 LOGIN (Basic Auth)
+def validar_login():
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False, Response(
+            "Login necessário",
+            401,
+            {"WWW-Authenticate": 'Basic realm="Login Required"'}
+        )
+
+    try:
+        encoded = auth_header.split(" ")[1]
+        decoded = b64decode(encoded).decode("utf-8")
+        username, password = decoded.split(":")
+
+        if (
+            username == os.environ.get("API_USER") and
+            password == os.environ.get("API_PASSWORD")
+        ):
+            return True, None
+    except:
+        pass
+
+    return False, Response(
+        "Credenciais inválidas",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Login Required"'}
+    )
+
+
+# 🔐 POST protegido por TOKEN
 @app.route("/upload_excel", methods=["POST"])
 def upload_excel():
-    # 🔐 Validação do token
     token = request.headers.get("Authorization")
 
     if not SECRET_TOKEN:
@@ -35,12 +67,10 @@ def upload_excel():
         if not data:
             return jsonify({"error": "JSON não enviado"}), 400
 
-        # garante lista
         if isinstance(data, dict):
             data = [data]
 
         for doc in data:
-
             nome_maquina = doc.get("Nome da máquina")
 
             if not nome_maquina:
@@ -53,7 +83,6 @@ def upload_excel():
             try:
                 collection.update_one(filtro, {"$set": doc}, upsert=True)
             except DuplicateKeyError:
-                print("⚠️ Duplicidade detectada (nome já existe)")
                 return jsonify({
                     "error": "Máquina duplicada (nome já existe)"
                 }), 409
@@ -67,8 +96,13 @@ def upload_excel():
         return jsonify({"error": str(e)}), 500
 
 
+# 🔐 GET protegido por LOGIN
 @app.route("/dados", methods=["GET"])
 def listar_dados():
+    autorizado, erro = validar_login()
+    if not autorizado:
+        return erro
+
     try:
         dados = list(collection.find({}, {"_id": 0}))
         json_str = json.dumps(dados, ensure_ascii=False)
@@ -77,8 +111,13 @@ def listar_dados():
         return jsonify({"error": str(e)}), 500
 
 
+# 🔐 GET protegido por LOGIN
 @app.route("/mongo_info", methods=["GET"])
 def mongo_info():
+    autorizado, erro = validar_login()
+    if not autorizado:
+        return erro
+
     try:
         total = collection.count_documents({})
         return jsonify({

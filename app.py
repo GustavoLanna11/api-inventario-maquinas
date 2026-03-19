@@ -6,6 +6,9 @@ from pymongo.errors import DuplicateKeyError
 
 app = Flask(__name__)
 
+# 🔐 Token vindo do ambiente (Render)
+SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN")
+
 collection = get_collection()
 
 try:
@@ -17,6 +20,15 @@ except Exception as e:
 
 @app.route("/upload_excel", methods=["POST"])
 def upload_excel():
+    # 🔐 Validação do token
+    token = request.headers.get("Authorization")
+
+    if not SECRET_TOKEN:
+        return jsonify({"error": "Token não configurado na API"}), 500
+
+    if token != f"Bearer {SECRET_TOKEN}":
+        return jsonify({"error": "Não autorizado"}), 401
+
     try:
         data = request.get_json()
 

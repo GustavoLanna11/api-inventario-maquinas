@@ -28,7 +28,6 @@ def health():
             "status": "ok",
             "service": "api-inventario",
             "mongo": "connected",
-            "documents": total
         }), 200
     except Exception as e:
         return jsonify({

@@ -1,6 +1,7 @@
 from pymongo import MongoClient
 import os
 
+
 # URI do Mongo vindo do Render (Environment Variable)
 MONGO_URI = os.environ.get("MONGO_URI")
 

@@ -7,7 +7,7 @@ from pymongo.errors import DuplicateKeyError
 
 app = Flask(__name__)
 
-# 🔐 Token vindo do ambiente (Render)
+# Token vindo do ambiente (Render)
 SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN")
 
 collection = get_collection()
@@ -19,7 +19,27 @@ except Exception as e:
     print(f"⚠️ Índice já existe ou erro ao criar: {e}")
 
 
-# 🔐 LOGIN (Basic Auth)
+# Rota de Health para monitoramento do serviço
+@app.route("/health", methods=["GET"])
+def health():
+    try:
+        total = collection.count_documents({})
+        return jsonify({
+            "status": "ok",
+            "service": "api-inventario",
+            "mongo": "connected",
+            "documents": total
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "service": "api-inventario",
+            "mongo": "disconnected",
+            "error": str(e)
+        }), 500
+
+
+# Login (Basic Auth)
 def validar_login():
     auth_header = request.headers.get("Authorization")
 
@@ -50,7 +70,7 @@ def validar_login():
     )
 
 
-# 🔐 POST protegido por TOKEN
+# POST protegido por TOKEN
 @app.route("/upload_excel", methods=["POST"])
 def upload_excel():
     token = request.headers.get("Authorization")
@@ -96,7 +116,7 @@ def upload_excel():
         return jsonify({"error": str(e)}), 500
 
 
-# 🔐 GET protegido por LOGIN
+# GET protegido por LOGIN
 @app.route("/dados", methods=["GET"])
 def listar_dados():
     autorizado, erro = validar_login()
@@ -111,7 +131,7 @@ def listar_dados():
         return jsonify({"error": str(e)}), 500
 
 
-# 🔐 GET protegido por LOGIN
+# GET protegido por LOGIN
 @app.route("/mongo_info", methods=["GET"])
 def mongo_info():
     autorizado, erro = validar_login()

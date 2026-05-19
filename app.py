@@ -147,6 +147,53 @@ def mongo_info():
         return jsonify({"erro": str(e)}), 500
 
 
+# PUT protegido por LOGIN
+@app.route("/editar_maquina", methods=["PUT"])
+def editar_maquina():
+
+    autorizado, erro = validar_login()
+    if not autorizado:
+        return erro
+
+    try:
+
+        dados = request.get_json()
+
+        nome_maquina = dados.get("Nome da máquina")
+
+        if not nome_maquina:
+            return jsonify({
+                "error": "Nome da máquina não informado"
+            }), 400
+
+        campos_editaveis = {
+            "Etiqueta": dados.get("Etiqueta"),
+            "Cidade": dados.get("Cidade"),
+            "Departamento": dados.get("Departamento"),
+            "Unidade Residente": dados.get("Unidade Residente"),
+            "Observações": dados.get("Observações")
+        }
+
+        resultado = collection.update_one(
+            {"Nome da máquina": nome_maquina},
+            {"$set": campos_editaveis}
+        )
+
+        if resultado.matched_count == 0:
+            return jsonify({
+                "error": "Máquina não encontrada"
+            }), 404
+
+        return jsonify({
+            "message": "✅ Máquina atualizada com sucesso"
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("🚀 API rodando com MongoDB (modo JSON)")

@@ -154,11 +154,17 @@ def editar_maquina():
     autorizado, erro = validar_login()
     if not autorizado:
         return erro
-
     try:
-
         dados = request.get_json()
-
+        # Corrige NaN / Infinity para JSON válido
+        for chave, valor in dados.items():
+            if isinstance(valor, float):
+                if valor != valor:
+                    dados[chave] = None
+                elif valor == float("inf"):
+                    dados[chave] = None
+                elif valor == float("-inf"):
+                    dados[chave] = None
         nome_maquina = dados.get("Nome da máquina")
 
         if not nome_maquina:
@@ -192,7 +198,6 @@ def editar_maquina():
         return jsonify({
             "error": str(e)
         }), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

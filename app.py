@@ -72,6 +72,7 @@ def validar_login():
 # POST protegido por TOKEN
 @app.route("/upload_excel", methods=["POST"])
 def upload_excel():
+
     token = request.headers.get("Authorization")
 
     if not SECRET_TOKEN:
@@ -81,6 +82,7 @@ def upload_excel():
         return jsonify({"error": "Não autorizado"}), 401
 
     try:
+
         data = request.get_json()
 
         if not data:
@@ -89,31 +91,72 @@ def upload_excel():
         if isinstance(data, dict):
             data = [data]
 
+        # Campos preenchidos manualmente pelo dashboard
+        campos_preservados = [
+            "Etiqueta",
+            "Cidade",
+            "Departamento",
+            "Unidade Residente",
+            "Observações"
+        ]
+
         for doc in data:
+
             nome_maquina = doc.get("Nome da máquina")
 
             if not nome_maquina:
-                return jsonify({"error": "Nome da máquina é obrigatório"}), 400
+                return jsonify({
+                    "error": "Nome da máquina é obrigatório"
+                }), 400
 
-            print("➡️ Processando:", nome_maquina, doc.get("Número de Série"))
+            print(f"➡️ Processando: {nome_maquina}")
 
-            filtro = {"Nome da máquina": nome_maquina}
+            maquina_existente = collection.find_one(
+                {"Nome da máquina": nome_maquina},
+                {"_id": 0}
+            )
+
+            if maquina_existente:
+
+                # Começa com tudo que já existe
+                documento_final = maquina_existente.copy()
+
+                # Atualiza os dados vindos do agente
+                documento_final.update(doc)
+
+                # Restaura os campos administrativos
+                for campo in campos_preservados:
+                    documento_final[campo] = maquina_existente.get(campo)
+
+            else:
+                # Máquina nova
+                documento_final = doc
 
             try:
-                collection.update_one(filtro, {"$set": doc}, upsert=True)
+
+                collection.update_one(
+                    {"Nome da máquina": nome_maquina},
+                    {"$set": documento_final},
+                    upsert=True
+                )
+
             except DuplicateKeyError:
+
                 return jsonify({
-                    "error": "Máquina duplicada (nome já existe)"
+                    "error": "Máquina duplicada"
                 }), 409
 
-        print("📦 Dados recebidos:", data)
-
-        return jsonify({"message": "✅ Dados inseridos/atualizados no MongoDB!"})
+        return jsonify({
+            "message": "✅ Dados inseridos/atualizados!"
+        }), 200
 
     except Exception as e:
-        print(f"❌ Erro upload: {e}")
-        return jsonify({"error": str(e)}), 500
 
+        print(f"❌ Erro upload: {e}")
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 # GET protegido por LOGIN
 @app.route("/dados", methods=["GET"])

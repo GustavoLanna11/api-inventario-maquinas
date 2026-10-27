@@ -242,6 +242,45 @@ def editar_maquina():
             "error": str(e)
         }), 500
 
+
+# DELETE protegido por LOGIN
+@app.route("/excluir_maquina", methods=["DELETE"])
+def excluir_maquina():
+    autorizado, erro = validar_login()
+    if not autorizado:
+        return erro
+
+    try:
+        dados = request.get_json(silent=True) or {}
+        nome_maquina = dados.get("Nome da máquina")
+
+        if not isinstance(nome_maquina, str) or not nome_maquina.strip():
+            return jsonify({
+                "error": "Nome da máquina não informado"
+            }), 400
+
+        nome_maquina = nome_maquina.strip()
+
+        resultado = collection.delete_one({
+            "Nome da máquina": nome_maquina
+        })
+
+        if resultado.deleted_count == 0:
+            return jsonify({
+                "error": "Máquina não encontrada"
+            }), 404
+
+        return jsonify({
+            "message": f"Máquina {nome_maquina} excluída com sucesso"
+        }), 200
+
+    except Exception as e:
+        print(f"Erro ao excluir máquina: {e}")
+        return jsonify({
+            "error": "Erro interno ao excluir a máquina"
+        }), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("🚀 API rodando com MongoDB (modo JSON)")

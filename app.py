@@ -1,516 +1,694 @@
-from flask import Flask, request, jsonify
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError
+from flask import Flask, request, jsonify, Response
+import os
+import json
+import re
+from base64 import b64decode
 from datetime import datetime, timezone
 from bson import ObjectId
-from functools import wraps
-import os
-import logging
-import math
+from database import get_collection
+from pymongo.errors import DuplicateKeyError
 
 app = Flask(__name__)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Token vindo do ambiente (Render)
+SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN")
 
-MONGO_URI = os.getenv("MONGO_URI")
-API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN")
-API_USER = os.getenv("API_USER")
-API_PASSWORD = os.getenv("API_PASSWORD")
+collection = get_collection()
 
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI não configurada")
+# Coleção separada para tentativas de cadastro duplicadas
+tentativas_collection = collection.database["tentativas_cadastro"]
 
-client = MongoClient(MONGO_URI)
-db = client.get_default_database()
-
-collection = db["maquinas"]
-
-collection.create_index(
-    [("Nome da máquina", ASCENDING)],
-    unique=True
-)
+try:
+    collection.create_index("Nome da máquina", unique=True)
+    print("🔒 Índice único criado para 'Nome da máquina'")
+except Exception as e:
+    print(f"⚠️ Índice já existe ou erro ao criar: {e}")
 
 
-def get_collection():
-    return db["maquinas"]
-
-
-def get_tentativas_collection():
-    return db["tentativas_cadastro"]
-
-
-def basic_auth_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.authorization
-
-        if not auth:
-            return jsonify({"erro": "Autenticação necessária"}), 401
-
-        if auth.username != API_USER or auth.password != API_PASSWORD:
-            return jsonify({"erro": "Usuário ou senha inválidos"}), 401
-
-        return f(*args, **kwargs)
-
-    return decorated
-
-
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"erro": "Token não informado"}), 401
-
-        token = auth_header.replace("Bearer ", "", 1)
-
-        if token != API_SECRET_TOKEN:
-            return jsonify({"erro": "Token inválido"}), 403
-
-        return f(*args, **kwargs)
-
-    return decorated
-
-
-def serialize_document(doc):
-    if not doc:
-        return None
-
-    doc["_id"] = str(doc["_id"])
-
-    for key, value in list(doc.items()):
-        if isinstance(value, datetime):
-            doc[key] = value.isoformat()
-
-    return doc
-
-
-def serial_valido(serial):
-    if not serial:
-        return False
-
-    serial = str(serial).strip()
-
-    if not serial:
-        return False
-
-    invalidos = {
-        "filled by oem",
-        "to be filled by o.e.m.",
-        "default string",
-        "unknown",
-        "n/a",
-        "na",
-        "none",
-        "null",
-        "serial number",
-    }
-
-    return serial.lower() not in invalidos
-
-
-def serial_normalizado(serial):
-    return str(serial).strip().lower()
-
+# ==========================
+# HEALTH CHECK
+# ==========================
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "online"
+    try:
+        total = collection.count_documents({})
+        return jsonify({
+            "status": "ok",
+            "service": "api-inventario",
+            "mongo": "connected",
+            "documentos": total
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "service": "api-inventario",
+            "mongo": "disconnected",
+            "error": str(e)
+        }), 500
+
+
+# ==========================
+# AUTENTICAÇÃO BASIC AUTH
+# ==========================
+
+def validar_login():
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False, Response(
+            "Login necessário",
+            401,
+            {"WWW-Authenticate": 'Basic realm="Login Required"'}
+        )
+
+    try:
+        encoded = auth_header.split(" ", 1)[1]
+        decoded = b64decode(encoded).decode("utf-8")
+        username, password = decoded.split(":", 1)
+
+        if (
+            username == os.environ.get("API_USER")
+            and password == os.environ.get("API_PASSWORD")
+        ):
+            return True, None
+
+    except Exception:
+        pass
+
+    return False, Response(
+        "Credenciais inválidas",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Login Required"'}
+    )
+
+
+# ==========================
+# NORMALIZAÇÃO DE NÚMERO DE SÉRIE
+# ==========================
+
+SERIAIS_INVALIDOS = {
+    "",
+    "não encontrado",
+    "nao encontrado",
+    "filled by oem",
+    "to be filled by o.e.m.",
+    "to be filled by oem",
+    "default string",
+    "unknown",
+    "none",
+    "null",
+    "n/a",
+    "na"
+}
+
+
+def normalizar_serial(valor):
+    if valor is None:
+        return ""
+
+    serial = str(valor).strip()
+
+    if serial.casefold() in SERIAIS_INVALIDOS:
+        return ""
+
+    return serial
+
+
+# ==========================
+# CONTROLE DE TENTATIVAS DUPLICADAS
+# ==========================
+
+def agora_utc():
+    return datetime.now(timezone.utc)
+
+
+def serial_existente(serial):
+    return collection.find_one({
+        "Número de Série": {
+            "$regex": r"^\s*" + re.escape(serial) + r"\s*$",
+            "$options": "i"
+        }
     })
 
+
+def salvar_tentativa_duplicada(doc, serial, maquina_existente):
+    agora = agora_utc()
+
+    filtro = {
+        "Nome da máquina": doc["Nome da máquina"],
+        "Número de Série": serial,
+        "status": "pendente"
+    }
+
+    dados_maquina = dict(doc)
+    dados_maquina.pop("_id", None)
+
+    tentativa = tentativas_collection.find_one(filtro)
+
+    if tentativa:
+        tentativas_collection.update_one(
+            {"_id": tentativa["_id"]},
+            {
+                "$set": {
+                    "dados_maquina": dados_maquina,
+                    "maquina_existente": maquina_existente,
+                    "ultima_tentativa": agora
+                },
+                "$inc": {
+                    "quantidade_tentativas": 1
+                }
+            }
+        )
+
+    else:
+        tentativas_collection.insert_one({
+            "Nome da máquina": doc["Nome da máquina"],
+            "Número de Série": serial,
+            "maquina_existente": maquina_existente,
+            "dados_maquina": dados_maquina,
+            "status": "pendente",
+            "criada_em": agora,
+            "ultima_tentativa": agora,
+            "quantidade_tentativas": 1
+        })
+
+
+# ==========================
+# UPLOAD DO AGENTE GPO
+# ==========================
 
 @app.route("/upload_excel", methods=["POST"])
-@token_required
 def upload_excel():
-    dados = request.get_json(silent=True)
+    token = request.headers.get("Authorization")
 
-    if not dados:
+    if not SECRET_TOKEN:
         return jsonify({
-            "erro": "JSON não informado"
-        }), 400
+            "error": "Token não configurado na API"
+        }), 500
 
-    if isinstance(dados, dict):
-        maquinas = dados.get("maquinas", [])
+    if token != f"Bearer {SECRET_TOKEN}":
+        return jsonify({"error": "Não autorizado"}), 401
 
-        if not maquinas:
-            maquinas = [dados]
-    elif isinstance(dados, list):
-        maquinas = dados
-    else:
-        return jsonify({
-            "erro": "Formato inválido"
-        }), 400
+    try:
+        data = request.get_json(silent=True)
 
-    col = get_collection()
-    tentativas = get_tentativas_collection()
+        if not data:
+            return jsonify({"error": "JSON não enviado"}), 400
 
-    inseridas = 0
-    atualizadas = 0
-    pendentes = 0
-    erros = []
+        if isinstance(data, dict):
+            data = [data]
 
-    campos_admin = [
-        "Etiqueta",
-        "Cidade",
-        "Departamento",
-        "Unidade Residente",
-        "Observações"
-    ]
+        if not isinstance(data, list):
+            return jsonify({
+                "error": "O JSON deve ser um objeto ou uma lista de objetos"
+            }), 400
 
-    for maquina in maquinas:
-        try:
-            nome = str(
-                maquina.get("Nome da máquina", "")
-            ).strip()
+        campos_preservados = [
+            "Etiqueta",
+            "Cidade",
+            "Departamento",
+            "Unidade Residente",
+            "Observações"
+        ]
 
-            if not nome:
-                continue
+        cadastradas = 0
+        atualizadas = 0
+        ignoradas = []
 
-            existente = col.find_one({
-                "Nome da máquina": nome
+        for doc_original in data:
+
+            if not isinstance(doc_original, dict):
+                return jsonify({
+                    "error": "Cada máquina deve ser um objeto JSON"
+                }), 400
+
+            doc = doc_original.copy()
+            nome_maquina = doc.get("Nome da máquina")
+
+            if not isinstance(nome_maquina, str) or not nome_maquina.strip():
+                return jsonify({
+                    "error": "Nome da máquina é obrigatório"
+                }), 400
+
+            nome_maquina = nome_maquina.strip()
+            doc["Nome da máquina"] = nome_maquina
+
+            serial = normalizar_serial(doc.get("Número de Série"))
+
+            # Procura primeiro pelo nome da máquina.
+            maquina_existente = collection.find_one({
+                "Nome da máquina": nome_maquina
             })
 
-            if existente:
-                update_data = {}
+            if maquina_existente:
+                # Máquina existente: mantém os dados antigos
+                # e atualiza os campos técnicos enviados pelo agente.
+                documento_final = maquina_existente.copy()
+                documento_final.update(doc)
 
-                for campo in campos_admin:
-                    if campo in existente:
-                        update_data[campo] = existente[campo]
+                # Não permite que o agente sobrescreva
+                # os campos administrativos do dashboard.
+                for campo in campos_preservados:
+                    documento_final[campo] = maquina_existente.get(campo)
 
-                for campo, valor in maquina.items():
-                    if campo not in campos_admin:
-                        update_data[campo] = valor
-
-                col.update_one(
-                    {"_id": existente["_id"]},
-                    {"$set": update_data}
+                # Se o agente enviar serial vazio ou inválido,
+                # preserva um serial válido já cadastrado.
+                serial_antigo = normalizar_serial(
+                    maquina_existente.get("Número de Série")
                 )
+
+                if not serial and serial_antigo:
+                    documento_final["Número de Série"] = (
+                        maquina_existente["Número de Série"]
+                    )
+
+                try:
+                    collection.update_one(
+                        {"_id": maquina_existente["_id"]},
+                        {"$set": {
+                            chave: valor
+                            for chave, valor in documento_final.items()
+                            if chave != "_id"
+                        }}
+                    )
+                except DuplicateKeyError:
+                    return jsonify({
+                        "error": "Conflito de duplicidade ao atualizar",
+                        "maquina": nome_maquina
+                    }), 409
 
                 atualizadas += 1
+                print(f"🔄 Máquina atualizada: {nome_maquina}")
                 continue
 
-            serial = maquina.get("Número de Série", "")
+            # Máquina nova: verifica se o serial válido
+            # já pertence a outro registro.
+            if serial:
+                registro_serial = serial_existente(serial)
 
-            if serial_valido(serial):
-                serial_norm = serial_normalizado(serial)
-
-                duplicada = col.find_one({
-                    "Número de Série": {
-                        "$regex": f"^{serial_norm}$",
-                        "$options": "i"
-                    }
-                })
-
-                if duplicada:
-                    tentativa_existente = tentativas.find_one({
-                        "Nome da máquina": nome,
-                        "Número de Série": serial,
-                        "status": "pendente"
-                    })
-
-                    agora = datetime.now(timezone.utc)
-
-                    if tentativa_existente:
-                        tentativas.update_one(
-                            {"_id": tentativa_existente["_id"]},
-                            {
-                                "$set": {
-                                    "dados_maquina": maquina,
-                                    "maquina_existente": duplicada.get(
-                                        "Nome da máquina"
-                                    ),
-                                    "updated_at": agora
-                                },
-                                "$inc": {
-                                    "quantidade_tentativas": 1
-                                }
-                            }
+                if registro_serial:
+                    salvar_tentativa_duplicada(
+                        doc=doc,
+                        serial=serial,
+                        maquina_existente=registro_serial.get(
+                            "Nome da máquina",
+                            "Desconhecida"
                         )
-                    else:
-                        tentativas.insert_one({
-                            "Nome da máquina": nome,
-                            "Número de Série": serial,
-                            "maquina_existente": duplicada.get(
-                                "Nome da máquina"
-                            ),
-                            "dados_maquina": maquina,
-                            "status": "pendente",
-                            "quantidade_tentativas": 1,
-                            "created_at": agora,
-                            "updated_at": agora
-                        })
+                    )
 
-                    pendentes += 1
+                    print(
+                        f"⏳ Tentativa pendente: {nome_maquina}; "
+                        f"serial já pertence a "
+                        f"{registro_serial.get('Nome da máquina', 'Desconhecida')}."
+                    )
                     continue
 
+            # Máquina nova sem serial duplicado.
+            # Seriais vazios ou inválidos não bloqueiam o cadastro.
             try:
-                col.insert_one(maquina)
-                inseridas += 1
+                collection.insert_one(doc)
+                cadastradas += 1
+                print(f"✅ Máquina cadastrada: {nome_maquina}")
 
             except DuplicateKeyError:
-                logger.exception(
-                    "Máquina já existente: %s",
-                    nome
-                )
+                # Proteção adicional para concorrência
+                # e índice único pelo nome da máquina.
+                ignoradas.append({
+                    "Nome da máquina": nome_maquina,
+                    "Número de Série": serial,
+                    "Motivo": "Nome da máquina já cadastrado"
+                })
 
-        except Exception as e:
-            logger.exception("Erro processando máquina")
+        return jsonify({
+            "message": "Processamento do inventário concluído",
+            "máquinas_cadastradas": cadastradas,
+            "máquinas_atualizadas": atualizadas,
+            "máquinas_ignoradas_por_duplicidade": len(ignoradas),
+            "detalhes_duplicidades": ignoradas
+        }), 200
 
-            erros.append({
-                "maquina": maquina.get("Nome da máquina"),
-                "erro": str(e)
-            })
+    except Exception as e:
+        print(f"❌ Erro upload: {e}")
 
-    return jsonify({
-        "mensagem": "Processamento concluído",
-        "inseridas": inseridas,
-        "atualizadas": atualizadas,
-        "pendentes": pendentes,
-        "erros": erros
-    })
+        return jsonify({
+            "error": str(e)
+        }), 500
 
+
+# ==========================
+# LISTAR MÁQUINAS
+# ==========================
 
 @app.route("/dados", methods=["GET"])
-@basic_auth_required
-def dados():
-    maquinas = list(
-        get_collection().find({})
-    )
+def listar_dados():
+    autorizado, erro = validar_login()
 
-    return jsonify([
-        serialize_document(maquina)
-        for maquina in maquinas
-    ])
+    if not autorizado:
+        return erro
 
+    try:
+        dados = list(collection.find({}, {"_id": 0}))
+        json_str = json.dumps(dados, ensure_ascii=False, allow_nan=False)
+
+        return Response(
+            json_str,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================
+# LISTAR TENTATIVAS DE CADASTRO
+# ==========================
 
 @app.route("/tentativas_cadastro", methods=["GET"])
-@basic_auth_required
-def tentativas_cadastro():
-    status = request.args.get(
-        "status",
-        "pendente"
-    )
+def listar_tentativas_cadastro():
+    autorizado, erro = validar_login()
 
-    tentativas = list(
-        get_tentativas_collection()
-        .find({"status": status})
-        .sort("created_at", -1)
-    )
+    if not autorizado:
+        return erro
 
-    return jsonify([
-        serialize_document(tentativa)
-        for tentativa in tentativas
-    ])
+    status = request.args.get("status", "pendente")
 
+    if status not in {"pendente", "aprovada", "recusada"}:
+        return jsonify({"error": "Status inválido"}), 400
+
+    try:
+        tentativas = list(
+            tentativas_collection.find({
+                "status": status
+            }).sort("ultima_tentativa", -1)
+        )
+
+        resultado = []
+
+        for tentativa in tentativas:
+            resultado.append({
+                "_id": str(tentativa["_id"]),
+                "id": str(tentativa["_id"]),
+                "Nome da máquina": tentativa.get(
+                    "Nome da máquina", ""
+                ),
+                "Número de Série": tentativa.get(
+                    "Número de Série", ""
+                ),
+                "maquina_existente": tentativa.get(
+                    "maquina_existente", ""
+                ),
+                "dados_maquina": tentativa.get(
+                    "dados_maquina", {}
+                ),
+                "status": tentativa.get("status", "pendente"),
+                "criada_em": (
+                    tentativa["criada_em"].isoformat()
+                    if tentativa.get("criada_em") else None
+                ),
+                "ultima_tentativa": (
+                    tentativa["ultima_tentativa"].isoformat()
+                    if tentativa.get("ultima_tentativa") else None
+                ),
+                "quantidade_tentativas": tentativa.get(
+                    "quantidade_tentativas", 1
+                )
+            })
+
+        return jsonify(resultado), 200
+
+    except Exception as e:
+        print(f"❌ Erro ao listar tentativas: {e}")
+
+        return jsonify({
+            "error": "Erro ao listar tentativas"
+        }), 500
+
+
+# ==========================
+# APROVAR OU RECUSAR TENTATIVA
+# ==========================
 
 @app.route(
     "/tentativas_cadastro/<tentativa_id>/decidir",
     methods=["POST"]
 )
-@basic_auth_required
-def decidir_tentativa(tentativa_id):
-    dados = request.get_json(silent=True) or {}
+def decidir_tentativa_cadastro(tentativa_id):
+    autorizado, erro = validar_login()
 
-    decisao = str(
-        dados.get("decisao", "")
-    ).lower().strip()
-
-    if decisao not in ["aprovar", "recusar"]:
-        return jsonify({
-            "erro": "Decisão deve ser 'aprovar' ou 'recusar'"
-        }), 400
-
-    tentativas = get_tentativas_collection()
-    col = get_collection()
+    if not autorizado:
+        return erro
 
     try:
-        tentativa = tentativas.find_one({
-            "_id": ObjectId(tentativa_id)
-        })
+        tentativa_oid = ObjectId(tentativa_id)
+
     except Exception:
         return jsonify({
-            "erro": "ID da tentativa inválido"
+            "error": "ID de tentativa inválido"
         }), 400
+
+    dados = request.get_json(silent=True) or {}
+    decisao = dados.get("decisao")
+
+    if decisao not in {"aprovar", "recusar"}:
+        return jsonify({
+            "error": "A decisão deve ser 'aprovar' ou 'recusar'"
+        }), 400
+
+    tentativa = tentativas_collection.find_one({
+        "_id": tentativa_oid,
+        "status": "pendente"
+    })
 
     if not tentativa:
         return jsonify({
-            "erro": "Tentativa não encontrada"
+            "error": "Tentativa não encontrada ou já decidida"
         }), 404
 
-    if tentativa.get("status") != "pendente":
-        return jsonify({
-            "erro": "Esta tentativa já foi decidida"
-        }), 409
+    agora = agora_utc()
 
-    agora = datetime.now(timezone.utc)
-
+    # Recusar: não insere a máquina e mantém o histórico.
     if decisao == "recusar":
-        tentativas.update_one(
-            {"_id": tentativa["_id"]},
+        resultado = tentativas_collection.update_one(
+            {
+                "_id": tentativa_oid,
+                "status": "pendente"
+            },
             {
                 "$set": {
                     "status": "recusada",
-                    "decidido_em": agora
+                    "decidida_em": agora,
+                    "decisao_por": "dashboard"
                 }
             }
         )
 
+        if resultado.modified_count == 0:
+            return jsonify({
+                "error": "A tentativa já foi decidida"
+            }), 409
+
         return jsonify({
-            "mensagem": "Tentativa recusada"
-        })
+            "message": "Tentativa recusada"
+        }), 200
 
-    maquina = tentativa.get(
-        "dados_maquina",
-        {}
-    )
+    # Aprovar: permite o serial duplicado,
+    # mas não permite duplicar o nome da máquina.
+    doc = dict(tentativa.get("dados_maquina") or {})
+    doc.pop("_id", None)
 
-    nome = str(
-        maquina.get("Nome da máquina", "")
-    ).strip()
+    nome_maquina = doc.get("Nome da máquina")
 
-    if not nome:
+    if not isinstance(nome_maquina, str) or not nome_maquina.strip():
         return jsonify({
-            "erro": "Máquina sem nome"
+            "error": "Dados da máquina inválidos na tentativa"
         }), 400
 
-    existente_nome = col.find_one({
-        "Nome da máquina": nome
-    })
+    nome_maquina = nome_maquina.strip()
+    doc["Nome da máquina"] = nome_maquina
 
-    if existente_nome:
+    if collection.find_one({
+        "Nome da máquina": nome_maquina
+    }):
         return jsonify({
-            "erro": (
-                "Já existe uma máquina com este nome. "
-                "A tentativa continua pendente para evitar sobrescrever o registro."
+            "error": (
+                "Já existe uma máquina com esse nome no inventário. "
+                "A tentativa continua pendente."
             )
         }), 409
 
     try:
-        col.insert_one(maquina)
+        collection.insert_one(doc)
 
     except DuplicateKeyError:
         return jsonify({
-            "erro": (
-                "Não foi possível aprovar porque "
-                "o nome da máquina já existe."
+            "error": (
+                "Não foi possível aprovar: já existe uma máquina "
+                "com esse nome. A tentativa continua pendente."
             )
         }), 409
 
-    tentativas.update_one(
-        {"_id": tentativa["_id"]},
+    resultado = tentativas_collection.update_one(
+        {
+            "_id": tentativa_oid,
+            "status": "pendente"
+        },
         {
             "$set": {
                 "status": "aprovada",
-                "decidido_em": agora
+                "decidida_em": agora,
+                "decisao_por": "dashboard",
+                "maquina_inserida": nome_maquina
             }
         }
     )
 
     return jsonify({
-        "mensagem": (
-            "Tentativa aprovada e máquina adicionada "
-            "ao inventário."
+        "message": (
+            f"Máquina {nome_maquina} cadastrada com sucesso. "
+            "O registro anterior foi mantido."
         )
-    })
+    }), 200
 
+
+# ==========================
+# INFORMAÇÕES DO MONGODB
+# ==========================
 
 @app.route("/mongo_info", methods=["GET"])
-@basic_auth_required
 def mongo_info():
-    col = get_collection()
+    autorizado, erro = validar_login()
 
-    return jsonify({
-        "database": db.name,
-        "collection": col.name,
-        "quantidade": col.count_documents({})
-    })
+    if not autorizado:
+        return erro
 
+    try:
+        total = collection.count_documents({})
+
+        return jsonify({
+            "status": "MongoDB conectado",
+            "documentos": total
+        }), 200
+
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
+# ==========================
+# EDITAR MÁQUINA
+# ==========================
 
 @app.route("/editar_maquina", methods=["PUT"])
-@basic_auth_required
 def editar_maquina():
-    dados = request.get_json(silent=True) or {}
+    autorizado, erro = validar_login()
 
-    nome = dados.get("Nome da máquina")
+    if not autorizado:
+        return erro
 
-    if not nome:
-        return jsonify({
-            "erro": "Nome da máquina não informado"
-        }), 400
+    try:
+        dados = request.get_json(silent=True)
 
-    campos_editaveis = [
-        "Etiqueta",
-        "Cidade",
-        "Departamento",
-        "Unidade Residente",
-        "Observações"
-    ]
+        if not isinstance(dados, dict):
+            return jsonify({
+                "error": "JSON inválido"
+            }), 400
 
-    atualizacao = {}
+        nome_maquina = dados.get("Nome da máquina")
 
-    for campo in campos_editaveis:
-        if campo in dados:
-            atualizacao[campo] = dados[campo]
+        if not isinstance(nome_maquina, str) or not nome_maquina.strip():
+            return jsonify({
+                "error": "Nome da máquina não informado"
+            }), 400
 
-    if not atualizacao:
-        return jsonify({
-            "erro": "Nenhum campo editável informado"
-        }), 400
+        # Converte NaN e Infinity em None.
+        for chave, valor in dados.items():
+            if isinstance(valor, float):
+                if valor != valor or valor in (float("inf"), float("-inf")):
+                    dados[chave] = None
 
-    resultado = get_collection().update_one(
-        {
-            "Nome da máquina": nome
-        },
-        {
-            "$set": atualizacao
+        campos_editaveis = {
+            campo: dados[campo]
+            for campo in [
+                "Etiqueta",
+                "Cidade",
+                "Departamento",
+                "Unidade Residente",
+                "Observações"
+            ]
+            if campo in dados
         }
-    )
 
-    if resultado.matched_count == 0:
+        if not campos_editaveis:
+            return jsonify({
+                "error": "Nenhum campo editável foi enviado"
+            }), 400
+
+        resultado = collection.update_one(
+            {"Nome da máquina": nome_maquina.strip()},
+            {"$set": campos_editaveis}
+        )
+
+        if resultado.matched_count == 0:
+            return jsonify({
+                "error": "Máquina não encontrada"
+            }), 404
+
         return jsonify({
-            "erro": "Máquina não encontrada"
-        }), 404
+            "message": "Máquina atualizada com sucesso"
+        }), 200
 
-    return jsonify({
-        "mensagem": "Máquina atualizada"
-    })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+
+# ==========================
+# EXCLUIR MÁQUINA
+# ==========================
 
 @app.route("/excluir_maquina", methods=["DELETE"])
-@basic_auth_required
 def excluir_maquina():
-    dados = request.get_json(silent=True) or {}
+    autorizado, erro = validar_login()
 
-    nome = dados.get("Nome da máquina")
+    if not autorizado:
+        return erro
 
-    if not nome:
+    try:
+        dados = request.get_json(silent=True) or {}
+        nome_maquina = dados.get("Nome da máquina")
+
+        if not isinstance(nome_maquina, str) or not nome_maquina.strip():
+            return jsonify({
+                "error": "Nome da máquina não informado"
+            }), 400
+
+        nome_maquina = nome_maquina.strip()
+
+        resultado = collection.delete_one({
+            "Nome da máquina": nome_maquina
+        })
+
+        if resultado.deleted_count == 0:
+            return jsonify({
+                "error": "Máquina não encontrada"
+            }), 404
+
         return jsonify({
-            "erro": "Nome da máquina não informado"
-        }), 400
+            "message": f"Máquina {nome_maquina} excluída com sucesso"
+        }), 200
 
-    resultado = get_collection().delete_one({
-        "Nome da máquina": nome
-    })
+    except Exception as e:
+        print(f"❌ Erro ao excluir máquina: {e}")
 
-    if resultado.deleted_count == 0:
         return jsonify({
-            "erro": "Máquina não encontrada"
-        }), 404
+            "error": "Erro interno ao excluir a máquina"
+        }), 500
 
-    return jsonify({
-        "mensagem": "Máquina excluída"
-    })
 
+# ==========================
+# EXECUÇÃO
+# ==========================
 
 if __name__ == "__main__":
-    port = int(
-        os.getenv("PORT", 5000)
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    port = int(os.environ.get("PORT", 5000))
+    print("🚀 API rodando com MongoDB (modo JSON)")
+    app.run(host="0.0.0.0", port=port)
